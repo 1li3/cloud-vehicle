@@ -1,9 +1,4 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-Python版本的HTTP/3服务器，兼容Go版本的client
-"""
-
+# community.py
 import asyncio
 import json
 import logging
@@ -11,296 +6,377 @@ import math
 import os
 import signal
 import sys
-import threading
-import time
-from datetime import datetime
-from typing import Dict, List, Any
+from collections import defaultdict
+from typing import Dict, List, Optional
 
-# 使用Hypercorn作为HTTP/3服务器
-# 需要安装: pip install hypercorn quart httpx
-from quart import Quart, request, jsonify
-from hypercorn.asyncio import serve
-from hypercorn.config import Config
+from aioquic.asyncio import QuicConnectionProtocol, serve
+from aioquic.h3.connection import H3_ALPN, H3Connection
+from aioquic.h3.events import (
+    DataReceived,
+    H3Event,
+    HeadersReceived,
+)
+from aioquic.quic.configuration import QuicConfiguration
+from aioquic.quic.events import QuicEvent
+from aioquic.tls import SessionTicket
 
-# 配置日志
+# 设置日志
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
+    format="%(asctime)s %(levelname)s %(name)s %(message)s",
 )
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("community")
 
-# 创建Quart应用实例
-app = Quart(__name__)
-
-# 使用线程锁保护的字典来模拟数据存储
-mock_data_store = {}
-mock_data_lock = threading.Lock()
-
-
+# 模拟Go代码中的数据结构
 class Data:
-    """数据结构类，对应Go中的Data结构体"""
     def __init__(self, **kwargs):
-        self.Name: str = kwargs.get('Name', '')
-        self.IP: str = kwargs.get('IP', '')
-        self.Port: int = kwargs.get('Port', 0)
-        self.X: float = kwargs.get('X', 0.0)
-        self.Y: float = kwargs.get('Y', 0.0)
-        self.Psi: float = kwargs.get('Psi', 0.0)
-        self.Stop_label: bool = kwargs.get('Stop_label', False)
-        self.Req_Resp: bool = kwargs.get('Req_Resp', False)
-        self.V: float = kwargs.get('V', 0.0)
-        self.W: float = kwargs.get('W', 0.0)
-        self.Path_Param: List[float] = kwargs.get('Path_Param', [])
-    
-    def to_dict(self) -> Dict[str, Any]:
-        """转换为字典格式"""
+        self.Name = kwargs.get("Name", "")
+        self.IP = kwargs.get("IP", "")
+        self.Port = kwargs.get("Port", 0)
+        self.X = kwargs.get("X", 0.0)
+        self.Y = kwargs.get("Y", 0.0)
+        self.Psi = kwargs.get("Psi", 0.0)
+        self.Stop_label = kwargs.get("Stop_label", False)
+        self.Req_Resp = kwargs.get("Req_Resp", False)
+        self.V = kwargs.get("V", 0.0)
+        self.W = kwargs.get("W", 0.0)
+        self.Path_Param = kwargs.get("Path_Param", [])
+
+    def to_dict(self):
         return {
-            'Name': self.Name,
-            'IP': self.IP,
-            'Port': self.Port,
-            'X': self.X,
-            'Y': self.Y,
-            'Psi': self.Psi,
-            'Stop_label': self.Stop_label,
-            'Req_Resp': self.Req_Resp,
-            'V': self.V,
-            'W': self.W,
-            'Path_Param': self.Path_Param
+            "Name": self.Name,
+            "IP": self.IP,
+            "Port": self.Port,
+            "X": self.X,
+            "Y": self.Y,
+            "Psi": self.Psi,
+            "Stop_label": self.Stop_label,
+            "Req_Resp": self.Req_Resp,
+            "V": self.V,
+            "W": self.W,
+            "Path_Param": self.Path_Param
         }
-    
-    @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> 'Data':
-        """从字典创建实例"""
-        return cls(**data)
 
+# 模拟Go代码中的mockDataStore
+mock_data_store = defaultdict(dict)
 
-def generate_straight_path(current_x: float, current_y: float, heading: float, point_count: int) -> List[float]:
-    """根据当前位置、朝向生成向斜前方的直线轨迹
-    
-    参数:
-        current_x, current_y: 当前位置坐标
-        heading: 车辆朝向（弧度制，0度为x轴正方向）
-        point_count: 需要生成的轨迹点数量
-    
-    返回:
-        格式为 [X1, Y1, X2, Y2, ...] 的轨迹点列表，每个点占两个元素
-    """
-    # 创建轨迹点列表，每个点需要2个float值（X和Y）
-    path = [0.0] * (point_count * 2)
-    
-    # 设置起始点为当前位置
-    path[0] = current_x
-    path[1] = current_y
-    
-    # 计算每个点之间的步长，使用固定步长使轨迹呈直线
-    step_size = 1.0  # 可以根据需要调整步长
-    
-    # 从第二个点开始计算
-    for i in range(1, point_count):
-        # 计算沿朝向方向的偏移量
-        step_distance = float(i) * step_size
-        
-        # 根据朝向计算新点的坐标
-        # 朝向为0度时，车辆朝向x轴正方向
-        # 角度增加时，逆时针旋转
-        x_offset = step_distance * math.cos(heading)
-        y_offset = step_distance * math.sin(heading)
-        
-        # 设置轨迹点
-        path[2 * i] = current_x + x_offset
-        path[2 * i + 1] = current_y + y_offset
-    
-    return path
+class HttpRequestHandler:
+    def __init__(self):
+        self.method = ""
+        self.path = ""
+        self.headers = {}
+        self.body = b""
+        self.stream_ended = False
 
+    def add_headers(self, headers):
+        """添加请求头"""
+        for header, value in headers:
+            if header == b":method":
+                self.method = value.decode()
+            elif header == b":path":
+                self.path = value.decode()
+            else:
+                # 存储其他头信息
+                self.headers[header.decode()] = value.decode()
 
-@app.route('/', methods=['GET'])
-async def root_handler():
-    """根路径处理函数"""
-    logger.info(f"Root request: {request}")
-    # 获取URL路径中的数字
-    path = request.path.lstrip('/')
-    if path and path.isdigit():
-        num = int(path)
-        if 0 < num <= 1024 * 1024 * 1024:  # 限制最大1GB
-            # 生成伪随机数据
-            # 这里简化处理，返回一些数据
-            return b'0' * min(num, 1024)  # 限制返回大小防止内存问题
-    
-    return '', 400
+    def add_data(self, data: bytes, stream_ended: bool):
+        """添加请求体数据"""
+        self.body += data
+        self.stream_ended = stream_ended
 
+    def is_complete(self):
+        """检查请求是否完整"""
+        return self.stream_ended
 
-@app.route('/demo/hash', methods=['POST'])
-async def hash_handler():
-    """/demo/hash路径处理函数"""
-    try:
-        # 解析请求体中的JSON数据
-        request_data = await request.get_json()
-        message = Data.from_dict(request_data)
-        
-        logger.info(f"Message X: {message.X}")
-        
-        # 模拟存储数据
-        logger.info("Storing data in mock store:")
-        for key, value in message.to_dict().items():
-            logger.info(f"Field '{key}': {value}")
-        
-        # 模拟返回数据
-        response = message
-        response.V = 1.0
-        response.W = 0.5
-        
-        # 返回相同的JSON数据
-        return jsonify(response.to_dict())
-    
-    except json.JSONDecodeError as e:
-        logger.error(f"Error decoding JSON: {e}")
-        return {'error': 'Invalid JSON data'}, 400
-    except Exception as e:
-        logger.error(f"Error processing request: {e}")
-        return {'error': 'Internal server error'}, 500
+    async def handle_request(self, protocol, stream_id):
+        """处理HTTP请求"""
+        if not self.is_complete():
+            logger.error(f"Request not complete for stream {stream_id}")
+            return
 
+        if self.method != "POST":
+            await self.send_error(protocol, stream_id, 405, "Only POST method is supported")
+            return
 
-@app.route('/demo/string', methods=['POST'])
-async def string_handler():
-    """/demo/string路径处理函数"""
-    try:
-        # 读取请求体
-        body_bytes = await request.get_data()
-        body_string = body_bytes.decode('utf-8')
-        
-        # 解析JSON数据
-        body_data_dict = json.loads(body_string)
-        body_data = Data.from_dict(body_data_dict)
-        
-        logger.info(f"Req from: {body_data.Name}")
-        
-        # 模拟在clouder_list中增加对象
-        logger.info(f"Processing request from: {body_data.Name}")
-        
-        # 线程安全地访问模拟数据存储
-        with mock_data_lock:
-            # 检查是否已存在
+        if self.path == "/demo/hash":
+            await self.handle_demo_hash(protocol, stream_id)
+        elif self.path == "/demo/string":
+            await self.handle_demo_string(protocol, stream_id)
+        else:
+            await self.send_error(protocol, stream_id, 404, "Not Found")
+
+    async def handle_demo_hash(self, protocol, stream_id):
+        """处理 /demo/hash 端点"""
+        try:
+            # 解析JSON数据
+            message_data = json.loads(self.body.decode())
+            message = Data(**message_data)
+            
+            logger.info(f"message.x: {message.X}")
+            logger.info("Storing data in mock store:")
+            
+            # 记录所有字段
+            for field_name, field_value in message.to_dict().items():
+                logger.info(f"Field '{field_name}': {field_value}")
+
+            # 创建响应数据
+            response = Data(**message_data)
+            response.V = 1.0
+            response.W = 0.5
+
+            # 发送JSON响应
+            await self.send_json_response(protocol, stream_id, response.to_dict())
+            
+        except json.JSONDecodeError as e:
+            await self.send_error(protocol, stream_id, 400, "Invalid JSON data")
+        except Exception as e:
+            logger.error(f"Error in /demo/hash: {e}")
+            await self.send_error(protocol, stream_id, 500, "Internal Server Error")
+
+    async def handle_demo_string(self, protocol, stream_id):
+        """处理 /demo/string 端点"""
+        try:
+            # 解析JSON数据
+            body_data = json.loads(self.body.decode())
+            body_obj = Data(**body_data)
+            
+            logger.info(f"Req from: {body_obj.Name}")
+
+            # 模拟在clouder_list中增加对象
             list_key = "clouder_list"
             if list_key in mock_data_store:
-                if isinstance(mock_data_store[list_key], dict):
-                    if body_data.Name not in mock_data_store[list_key]:
-                        mock_data_store[list_key][body_data.Name] = True
-                        logger.info(f"Add '{body_data.Name}' to clouder_list")
+                clouder_list = mock_data_store[list_key]
+                if body_obj.Name not in clouder_list:
+                    clouder_list[body_obj.Name] = True
+                    logger.info(f"Add '{body_obj.Name}' to clouder_list")
             else:
-                # 创建新的列表
-                mock_data_store[list_key] = {body_data.Name: True}
-                logger.info(f"Add '{body_data.Name}' to clouder_list")
-            
-            # 模拟将请求body字符串存入存储
-            mock_data_store[body_data.Name] = body_string
-            logger.info(f"Request Body: {body_string}")
-            
-            # 模拟获取键"carX-c"command的值
-            command_key = f"{body_data.Name}-c"
-            carcommand_data = None
-            exists = False
+                mock_data_store[list_key] = {body_obj.Name: True}
+                logger.info(f"Add '{body_obj.Name}' to clouder_list")
+
+            # 存储请求体
+            mock_data_store[body_obj.Name] = self.body.decode()
+            logger.info(f"Request Body: {self.body.decode()}")
+
+            # 检查命令键
+            command_key = f"{body_obj.Name}-c"
+            check_command_result = Data()
             
             if command_key in mock_data_store:
-                exists = True
-                carcommand_data = mock_data_store[command_key]
-            else:
-                # 如果键不存在，设置键值
-                mock_data_store[command_key] = body_string
-                logger.info(f"{body_data.Name} First connection")
-            
-        # 处理轨迹生成逻辑
-        # 首先解析响应数据到结构体
-        if exists and carcommand_data:
-            command_data_dict = json.loads(carcommand_data)
-            response = Data.from_dict(command_data_dict)
-            
-            # 检查Req_Resp是否为true，将其重置为false
-            if response.Req_Resp:
-                logger.info(f"Command: {carcommand_data}")
-                response.Req_Resp = False
+                car_command = mock_data_store[command_key]
+                check_command_result = Data(**json.loads(car_command))
                 
-                # 将更新后的值存回模拟存储
-                with mock_data_lock:
-                    mock_data_store[command_key] = json.dumps(response.to_dict())
-        else:
-            response = body_data  # 如果没有存储的命令，使用请求数据
+                if check_command_result.Req_Resp:
+                    logger.info(f"Command: {car_command}")
+                    check_command_result.Req_Resp = False
+                    command_ready_label_false = json.dumps(check_command_result.to_dict())
+                    mock_data_store[command_key] = command_ready_label_false
+                else:
+                    logger.info("No new command available, using current data")
+            else:
+                mock_data_store[command_key] = self.body.decode()
+                logger.info(f"{body_obj.Name} First connection")
+
+            # 准备响应数据
+            if command_key in mock_data_store:
+                response_data = json.loads(mock_data_store[command_key])
+                response = Data(**response_data)
+            else:
+                response = body_obj
+
+            # 生成路径参数
+            response.Path_Param = self.generate_straight_path(
+                body_obj.X, body_obj.Y, body_obj.Psi, 20
+            )
+            
+            logger.info(f"Generated path with {len(response.Path_Param)//2} points, "
+                       f"starting at ({body_obj.X:.2f}, {body_obj.Y:.2f}), "
+                       f"direction: {body_obj.Psi:.2f} radians")
+
+            # 发送响应
+            await self.send_json_response(protocol, stream_id, response.to_dict())
+
+        except json.JSONDecodeError as e:
+            await self.send_error(protocol, stream_id, 400, "Invalid JSON data")
+        except Exception as e:
+            logger.error(f"Error in /demo/string: {e}")
+            await self.send_error(protocol, stream_id, 500, "Internal Server Error")
+
+    def generate_straight_path(self, current_x: float, current_y: float, 
+                             heading: float, point_count: int) -> List[float]:
+        """生成直线路径，与Go版本保持一致"""
+        path = [0.0] * (point_count * 2)
+        path[0] = current_x
+        path[1] = current_y
         
-        # 生成轨迹点：从当前位置向斜前方延伸的直线
-        response.Path_Param = generate_straight_path(body_data.X, body_data.Y, body_data.Psi, 20)
+        step_size = 1.0
         
-        # 记录生成的轨迹信息
-        logger.info(f"Generated path with {len(response.Path_Param) // 2} points, "
-                    f"starting at ({body_data.X:.2f}, {body_data.Y:.2f}), "
-                    f"direction: {body_data.Psi:.2f} radians")
+        for i in range(1, point_count):
+            step_distance = float(i) * step_size
+            x_offset = step_distance * math.cos(heading)
+            y_offset = step_distance * math.sin(heading)
+            
+            path[2*i] = current_x + x_offset
+            path[2*i+1] = current_y + y_offset
         
-        # 返回JSON响应
-        return jsonify(response.to_dict())
+        return path
+
+    async def send_json_response(self, protocol, stream_id, data: dict):
+        """发送JSON响应"""
+        response_body = json.dumps(data).encode()
+        headers = [
+            (b":status", b"200"),
+            (b"content-type", b"application/json"),
+            (b"content-length", str(len(response_body)).encode()),
+        ]
+        
+        protocol._http.send_headers(
+            stream_id=stream_id,
+            headers=headers,
+        )
+        protocol._http.send_data(
+            stream_id=stream_id,
+            data=response_body,
+            end_stream=True
+        )
+
+    async def send_error(self, protocol, stream_id, status_code: int, message: str):
+        """发送错误响应"""
+        error_data = {"error": message}
+        response_body = json.dumps(error_data).encode()
+        headers = [
+            (b":status", str(status_code).encode()),
+            (b"content-type", b"application/json"),
+            (b"content-length", str(len(response_body)).encode()),
+        ]
+        
+        protocol._http.send_headers(
+            stream_id=stream_id,
+            headers=headers,
+        )
+        protocol._http.send_data(
+            stream_id=stream_id,
+            data=response_body,
+            end_stream=True
+        )
+
+class Http3ServerProtocol(QuicConnectionProtocol):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._http = None
+        self._handlers = {}  # 存储每个流的处理器
+
+    def quic_event_received(self, event: QuicEvent):
+        if self._http is None:
+            self._http = H3Connection(self._quic)
+        
+        # 将QUIC事件传递给HTTP/3层
+        for h3_event in self._http.handle_event(event):
+            self.h3_event_received(h3_event)
+
+    def h3_event_received(self, event: H3Event):
+        if isinstance(event, HeadersReceived):
+            self.handle_headers(event)
+        elif isinstance(event, DataReceived):
+            self.handle_data(event)
+
+    def handle_headers(self, event: HeadersReceived):
+        """处理HTTP头"""
+        stream_id = event.stream_id
+        
+        # 为新的流创建处理器
+        if stream_id not in self._handlers:
+            self._handlers[stream_id] = HttpRequestHandler()
+        
+        handler = self._handlers[stream_id]
+        handler.add_headers(event.headers)
+        
+        # 如果流已经结束（没有请求体），立即处理请求
+        if event.stream_ended:
+            handler.add_data(b"", True)
+            asyncio.create_task(self.process_request(stream_id))
+
+    def handle_data(self, event: DataReceived):
+        """处理HTTP数据"""
+        stream_id = event.stream_id
+        
+        if stream_id not in self._handlers:
+            logger.warning(f"Received data for unknown stream {stream_id}")
+            return
+        
+        handler = self._handlers[stream_id]
+        handler.add_data(event.data, event.stream_ended)
+        
+        # 如果流结束，处理请求
+        if event.stream_ended:
+            asyncio.create_task(self.process_request(stream_id))
+
+    async def process_request(self, stream_id: int):
+        """处理完整的HTTP请求"""
+        if stream_id not in self._handlers:
+            return
+        
+        handler = self._handlers[stream_id]
+        
+        try:
+            await handler.handle_request(self, stream_id)
+        except Exception as e:
+            logger.error(f"Error processing request for stream {stream_id}: {e}")
+        finally:
+            # 清理处理器
+            del self._handlers[stream_id]
+
+async def run_server(
+    host: str = "0.0.0.0",
+    port: int = 6121,
+    certificate: str = "certpath/cert.pem",
+    private_key: str = "certpath/priv.key",
+):
+    """运行HTTP/3服务器"""
     
-    except json.JSONDecodeError as e:
-        logger.error(f"Error decoding JSON: {e}")
-        return {'error': 'Invalid JSON data'}, 400
-    except Exception as e:
-        logger.error(f"Error processing request: {e}")
-        return {'error': 'Internal server error'}, 500
+    # 检查证书文件是否存在
+    if not os.path.exists(certificate) or not os.path.exists(private_key):
+        logger.error(f"Certificate files not found: {certificate}, {private_key}")
+        logger.info("Please generate certificates first")
+        return
 
+    # 配置QUIC
+    configuration = QuicConfiguration(
+        alpn_protocols=H3_ALPN,
+        is_client=False,
+        max_datagram_frame_size=65536,
+    )
+    
+    configuration.load_cert_chain(certificate, private_key)
 
-def handle_shutdown(signum, frame):
-    """处理系统信号，优雅关闭服务器"""
-    logger.info(f"Received signal {signum}. Shutting down...")
-    # 清理模拟数据存储
-    with mock_data_lock:
-        mock_data_store.clear()
+    # 启动服务器
+    server = await serve(
+        host=host,
+        port=port,
+        configuration=configuration,
+        create_protocol=Http3ServerProtocol,
+    )
+    
+    logger.info(f"HTTP/3 server listening on https://{host}:{port}")
+    
+    try:
+        await asyncio.Future()  # 永久运行
+    except KeyboardInterrupt:
+        logger.info("Received interrupt signal, shutting down...")
+    finally:
+        server.close()
+
+def signal_handler():
+    """处理退出信号"""
+    logger.info("Shutting down server...")
+    # 清理模拟数据存储（可选）
+    mock_data_store.clear()
     logger.info("Mock data store cleared")
     sys.exit(0)
 
-
-async def main():
-    """主函数"""
+if __name__ == "__main__":
     # 设置信号处理
-    signal.signal(signal.SIGINT, handle_shutdown)
-    signal.signal(signal.SIGTERM, handle_shutdown)
+    signal.signal(signal.SIGINT, lambda s, f: signal_handler())
+    signal.signal(signal.SIGTERM, lambda s, f: signal_handler())
     
-    # 配置Hypercorn服务器
-    config = Config()
-    config.bind = ['0.0.0.0:6121']  # 绑定到与Go版本相同的端口
-    config.certfile = 'certpath/cert.pem'  # TLS证书文件
-    config.keyfile = 'certpath/priv.key'   # TLS私钥文件
-    config.http3 = True   # 启用HTTP/3
-    config.h11 = True     # 启用HTTP/1.1
-    config.h2 = True      # 启用HTTP/2
-    config.loglevel = 'DEBUG'  # 设置日志级别为DEBUG
-    config.keep_alive_timeout = 30  # 增加保活超时
-    config.worker_class = 'asyncio'  # 使用asyncio工作器类
-    
-    # 检查证书文件是否存在
-    if not os.path.exists(config.certfile):
-        logger.error(f"Certificate file not found: {config.certfile}")
-        sys.exit(1)
-    if not os.path.exists(config.keyfile):
-        logger.error(f"Key file not found: {config.keyfile}")
-        sys.exit(1)
-    
-    logger.info(f"Starting multi-protocol server on {config.bind}")
-    logger.info(f"Using certfile: {config.certfile}")
-    logger.info(f"Using keyfile: {config.keyfile}")
-    logger.info("HTTP/1.1 enabled: True")
-    logger.info("HTTP/2 enabled: True")
-    logger.info("HTTP/3 enabled: True")
-    logger.info("Server will automatically negotiate protocol with clients")
-    logger.info("Waiting for client connections...")
-    
-    try:
-        await serve(app, config)
-    except Exception as e:
-        logger.error(f"Server error: {e}")
-        sys.exit(1)
-
-
-if __name__ == '__main__':
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        logger.info("Keyboard interrupt received, exiting...")
-    except Exception as e:
-        logger.error(f"Unexpected error: {e}")
-        sys.exit(1)
+    # 运行服务器
+    asyncio.run(run_server())
