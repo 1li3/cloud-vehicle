@@ -98,40 +98,10 @@ class HttpRequestHandler:
             await self.send_error(protocol, stream_id, 405, "Only POST method is supported")
             return
 
-        if self.path == "/demo/hash":
-            await self.handle_demo_hash(protocol, stream_id)
-        elif self.path == "/demo/string":
+        if self.path == "/demo/string":
             await self.handle_demo_string(protocol, stream_id)
         else:
             await self.send_error(protocol, stream_id, 404, "Not Found")
-
-    async def handle_demo_hash(self, protocol, stream_id):
-        """处理 /demo/hash 端点"""
-        try:
-            # 解析JSON数据
-            message_data = json.loads(self.body.decode())
-            message = Data(**message_data)
-            
-            logger.info(f"message.x: {message.X}")
-            logger.info("Storing data in mock store:")
-            
-            # 记录所有字段
-            for field_name, field_value in message.to_dict().items():
-                logger.info(f"Field '{field_name}': {field_value}")
-
-            # 创建响应数据
-            response = Data(**message_data)
-            response.V = 1.0
-            response.W = 0.5
-
-            # 发送JSON响应
-            await self.send_json_response(protocol, stream_id, response.to_dict())
-            
-        except json.JSONDecodeError as e:
-            await self.send_error(protocol, stream_id, 400, "Invalid JSON data")
-        except Exception as e:
-            logger.error(f"Error in /demo/hash: {e}")
-            await self.send_error(protocol, stream_id, 500, "Internal Server Error")
 
     async def handle_demo_string(self, protocol, stream_id):
         """处理 /demo/string 端点"""
@@ -184,11 +154,18 @@ class HttpRequestHandler:
                 response = body_obj
 
             # 生成路径参数
-            response.Path_Param = self.generate_straight_path(
-                body_obj.X, body_obj.Y, body_obj.Psi, 20
+            path_points = self.generate_straight_path(
+                body_obj.X, body_obj.Y, body_obj.Psi, 40
             )
+            response.Path_Param = path_points
             
-            logger.info(f"Generated path with {len(response.Path_Param)//2} points, "
+            # 修改X和Y为路径的最后一对点
+            if len(path_points) >= 2:
+                response.X = path_points[-2]  # 倒数第二个是最后一个点的X
+                response.Y = path_points[-1]  # 倒数第一个是最后一个点的Y
+                logger.info(f"Updated X,Y to last path point: ({response.X:.2f}, {response.Y:.2f})")
+            
+            logger.info(f"Generated path with {len(path_points)//2} points, "
                        f"starting at ({body_obj.X:.2f}, {body_obj.Y:.2f}), "
                        f"direction: {body_obj.Psi:.2f} radians")
 
